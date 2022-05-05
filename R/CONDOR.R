@@ -28,6 +28,10 @@
 #' in the modularity for each iteration. Default is min(10^{-4},1/(number of edges)),
 #' with number of edges determined by \code{nrow(condor.object$edges)}. User can
 #' set this parameter by passing a numeric value to deltaQmin.
+#' @param stepred is a numeric vector of length 1 containing the number of red nodes 
+#' that should be grouped together while computing red node membership.
+#' @param stepblue is a numeric vector of length 1 containing the number of blue nodes 
+#' that should be grouped together while computing red node membership.
 #' @return \code{condor.object} with \code{\link{condorModularityMax}} output
 #' included.
 #' @examples 
