@@ -42,7 +42,7 @@
 #' @import Matrix
 #' @export
 #' 
-condorCluster <- function(condor.object,cs.method="LCS",project=TRUE,low.memory=FALSE,deltaQmin="default"){
+condorCluster <- function(condor.object,cs.method="LCS",project=TRUE,memory='large',deltaQmin="default",stepred=10000, stepblue=100){
   
   elist <- condor.object$edges
   
@@ -118,13 +118,15 @@ condorCluster <- function(condor.object,cs.method="LCS",project=TRUE,low.memory=
     T0 <- data.frame(as.integer(factor(blue.names)),blue.membs)
   }
   #run bipartite modularity maximization using initial assignments T0
-  if(low.memory){
+  if(memory=='low'){
     condor.object <- condorModularityMax(condor.object,T0=T0,weights=weights,deltaQmin=deltaQmin)
   }
-  if(!low.memory){
+  else if(memory=='large'){
     condor.object <- condorMatrixModularity(condor.object,T0=T0,weights=weights,deltaQmin=deltaQmin)
   }
-  
+  else if(memory=='medium'){
+    condor.object <- condorSubsetModularity(condor.object,T0=T0,weights=weights,deltaQmin=deltaQmin,stepred=10000,stepblue=100)
+  }
   
   return(condor.object)
   }
@@ -296,7 +298,10 @@ plot.enrich.hist = function(qik_enrich_out,ks=TRUE,wilcoxon=TRUE,...){
 #' This function loads the entire adjacency matrix in memory, so if your
 #' network has more than ~50,000 nodes, you may want to use
 #' \code{\link{condorModularityMax}}, which is slower, but does not store
-#' the matrices in memory. Or, of course, you could move to a larger machine.
+#' the matrices in memory, or the \code{\link{condorSubsetModularity}}, which 
+#' is a bit slower but require much smaller memory space depending on your settings
+#' by splitting the red and blue nodes into subsets to compute modularity. 
+#' Or, of course, you could move to a larger machine.
 #' @param condor.object is a list created by 
 #' \code{\link{createCondorObject}}. \code{condor.object$edges} must 
 #' contain the edges in the giant connected component of a bipartite network 
@@ -698,6 +703,231 @@ condorModularityMax = function(condor.object,T0=cbind(seq_len(q),rep(1,q)),weigh
     Tmat[,2] <- as.integer(factor(Tmat[,2]))
   }
   colnames(qcom_out) <- c("Qcom","community")
+  condor.object$Qcoms = qcom_out
+  condor.object$modularity=Qhist
+  condor.object$red.memb=data.frame(red.names=red.names[R[,1]],com=R[,2])
+  condor.object$blue.memb=data.frame(blue.names=blue.names[Tmat[,1]],com=Tmat[,2])
+  
+  return(condor.object)
+  }
+
+#' Iteratively maximize bipartite modularity.
+#' 
+#' This function is based on the bipartite modularity
+#' as defined in "Modularity and community detection in bipartite networks"
+#' by Michael J. Barber, Phys. Rev. E 76, 066102 (2007)
+#' This function uses a slightly different implementation from the paper. It 
+#' does not use the "adaptive BRIM" method for identifying the number of 
+#' modules. Rather, it simply continues to iterate until the difference in 
+#' modularity between iterations is less that 10^-4. Starting from a random 
+#' initial condition, this could take some time. Use 
+#' \code{\link{condorCluster}} for quicker runtimes and likely better 
+#' clustering, it initializes the blue 
+#' node memberships by projecting the blue nodes into a unipartite "blue" 
+#' network and then identify communities in that network using a standard 
+#' unipartite community detection algorithm run on the projected network.
+#' See \code{\link{condorCluster}} for more details that.
+#' @param condor.object is a list created by 
+#' \code{\link{createCondorObject}}. \code{condor.object$edges} must 
+#' contain the edges in the giant connected component of a bipartite network 
+#' @param T0 is a two column data.frame with the initial community 
+#' assignment for each "blue" node, assuming there are more reds than blues, 
+#' though this is not strictly necessary. The first column contains the 
+#' node name, the second column the community assignment.
+#' @param weights edgeweights for each edge in \code{edgelist}.
+#' @param deltaQmin convergence parameter determining the minimum required increase
+#' in the modularity for each iteration. Default is min(10^-4,1/(number of edges)),
+#' with number of edges determined by \code{nrow(condor.object$edges)}. User can
+#' set this parameter by passing a numeric value to deltaQmin.
+#' @param stepred is a numeric vector of length 1 containing the number of red nodes 
+#' that should be grouped together while computing red node membership.
+#' @param stepblue is a numeric vector of length 1 containing the number of blue nodes 
+#' that should be grouped together while computing red node membership.
+#' @return Qcoms data.frame with modularity of each community. 
+#' @return modularity modularity value after each iteration.
+#' @return red.memb community membership of the red nodes
+#' @return blue.memb community membership of the blue.nodes
+#' @examples 
+#' r = c(1,1,1,2,2,2,3,3,3,4,4);
+#' b = c(1,2,3,1,2,4,2,3,4,3,4);
+#' reds <- c("Alice","Sue","Janine","Mary")
+#' blues <- c("Bob","John","Ed","Hank")
+#' elist <- data.frame(red=reds[r],blue=blues[b])
+#' condor.object <- createCondorObject(elist)
+#' #randomly assign blues to their own community
+#' T0 <- data.frame(nodes=blues,coms=1)
+#' condor.object <- condorSubsetModularity(condor.object,T0=T0)
+#' @import Matrix
+#' @import nnet
+#' @export
+#' 
+condorModularityMax = function(condor.object,T0=cbind(seq_len(q),rep(1,q)),weights=1,deltaQmin="default"){
+  
+  #assign convergence parameter
+  if(deltaQmin == "default"){
+    #number of edges
+    m = nrow(condor.object$edges)
+    deltaQmin <- min(10^-4,1/m)
+  }
+  if(deltaQmin != "default" & !is.numeric(deltaQmin)){
+    stop("deltaQmin must be either 'default' or a numeric value")
+  }
+  
+ #define local functions
+  #determine the position (index) of the (first) maximum of a numeric (or logical) vector. 
+  machine.which.max = function(X) {
+    thresh <- .Machine$double.eps
+    X[abs(X) <= thresh] <- 0
+    true_max <- which.max(X)
+    return(true_max)
+  }
+  
+  #determine the value of the (first) maximum of a numeric (or logical) vector. 
+  
+  machine.max = function(X) {
+    thresh <- .Machine$double.eps
+    X[abs(X) <= thresh] <- 0
+    true_max <- max(X)
+    return(true_max)
+  }
+  
+  #determine the position (index) of the (last) maximum of a numeric (or logical) vector. 
+  
+  machine.which.is.max = function(X) {
+    thresh <- .Machine$double.eps
+    X[abs(X) <= thresh] <- 0
+    true_max <- which.is.max(X)
+    return(true_max)
+  } 
+  
+  #Convert the edgelist to a sparseMatrix object
+  esub <- condor.object$edges
+  #make sure there's only one connected component
+  g.component.test <- graph.data.frame(esub,directed=FALSE)
+  if(!is.connected(g.component.test)){
+    stop("More than one connected component,
+         method requires only one connected component")
+  }
+  
+  #list red and blue members
+  reds <- as.integer(factor(esub[,1]))
+  red.names <- levels(factor(esub[,1]))
+  blues <- as.integer(factor(esub[,2]))
+  blue.names <- levels(factor(esub[,2]))
+  #ensure that nrows > ncols
+  if(length(red.names) < length(blue.names)){
+    stop("Adjacency matrix dimension mismatch: This code requires nrows > ncols")
+  }
+  
+  #Sparse matrix with the upper right block of the true Adjacency matrix. notices the dimension is reds x blues
+  A = sparseMatrix(i=reds,j=blues,x=weights,dims=c(length(unique(reds)),length(unique(blues))),index1=TRUE);
+  rownames(A) <- red.names
+  colnames(A) <- blue.names
+  edges = cbind(reds, blues) # list of edges
+
+  p = nrow(A)
+  q = ncol(A)
+  N = p+q
+  
+  #Sparse matrix with the upper right block of the true Adjacency matrix. Notice the dimension is reds x blues
+  ki = rowSums(A)
+  dj = colSums(A)
+  m = sum(ki) # m = sum(dj) too
+  
+  #initialize community assignments for red and blue nodes.
+  T0[,1] = as.integer(factor(T0[,1]))
+  Tmat <- T0
+  Tind <- data.matrix(T0) # Build gene community matrix with genes in lines and communities in columns
+  Rind = data.matrix(cbind(1:p, rep(0, length = p))) # initialization of SNP community matrix
+
+  #variables to track modularity changes after each loop
+  Qhist <- vector();
+  Qnow  <- 0
+  deltaQ <- 1
+  #______________________________________
+  iter=1
+  while(deltaQ > deltaQmin){
+    BTR <- NULL # Initialize table with all modularity score for each gene j in each community
+    #allocate red node to the community where it increases modularity most
+    Tm = matrix(0, nrow = q, ncol = max(Tind[, 2])) #Initialize gene community matrix with genes in lines and communities in columns
+    Tm[Tind] <- 1 #if gene is in community, set cell to 1
+    for(i in seq(stepred, max(stepred, length(red.names)), stepred)){
+      x=(i-(stepred)+1)
+      y=ifelse(i>length(red.names), length(red.names), i)
+      #calculate T tilde for a subset of red nodes
+      cat("Computing modularity for red nodes", x, "to", y, "...\n")
+      Btilde=-(ki[x:y] %o% dj)/m
+      ind=(edges[,1] %in% x:y)
+      edges.tmp=edges[ind,]
+      edges.tmp[,1]=edges.tmp[,1]-(i-stepred)
+      Btilde[edges.tmp] = weights[ind] + Btilde[edges.tmp]
+      Ttilde = Btilde %*% Tm # Compute modularity for each SNP in each community
+      #update Rind
+      Rind[x:y, 2] <- unname(apply(Ttilde, 1, machine.which.max)) # Find community for which the modularity is maximum for each SNP
+      negative_contribution <- unname(apply(Ttilde, 1, machine.max)) < 0 # identify SNPs for which only negative modularity are computed in all communities
+      if (any(negative_contribution)) { # if any, put them each in their own new community
+        num_new_com <- sum(negative_contribution)
+        cs <- length(unique(c(Tind[, 2], Rind[, 2])))
+        Rind[(x:y)[negative_contribution], 2] <- (cs + 1):(cs + num_new_com)
+      }
+    }
+    
+    #allocate blue node to the community where it increases modularity most
+    Rm = matrix(0, nrow = p, ncol = max(Rind[, 2])) #Initialize SNPs community matrix with SNPs in lines and communities in columns
+    Rm[data.matrix(Rind)] <- 1 #if SNP is in community, set cell to 1
+    BTR <- matrix(0, nrow = q, ncol = max(Rind[, 2]))
+    for(j in seq(stepblue, max(stepblue, length(blue.names)), stepblue)){
+      x=(j-(stepblue)+1)
+      y=ifelse(j>length(blue.names), length(blue.names), j)
+      #calculate R tilde, i.e., B_transpose * R, for a subset of blue nodes
+      cat("Computing modularity for blue nodes", x, "to", y, "...\n")
+      Btilde = -(ki %o% dj[x:y])/m
+      ind=(edges[,2] %in% x:y)
+      edges.tmp=edges[ind,]
+      edges.tmp[,2]=edges.tmp[,2]-(j-stepblue)
+      Btilde[edges.tmp] = weights[ind] + Btilde[edges.tmp]
+      Rtilde = crossprod(Btilde, Rm) # Compute modularity for each gene in each community
+      #update Tind and store maximum modularity value in BTR
+      Tind[x:y, 2] <- unname(apply(Rtilde, 1, machine.which.max)) # Find community for which the modularity is maximum for each gene
+      negative_contribution <- unname(apply(Rtilde, 1, machine.max)) < 0 # identify genes for which only negative modularity are computed in all communities
+      if (any(negative_contribution)) { # if any, put them each in their own new community
+        num_new_com <- sum(negative_contribution)
+        cs <- length(unique(c(Tind[, 2], Rind[, 2])))
+        Tind[(x:y)[negative_contribution], 2] <- (cs + 1):(cs + num_new_com)
+        BTR <- cbind(BTR, matrix(0, nrow=nrow(BTR), ncol=num_new_com ))
+      }
+      BTR[x:y, unname(apply(Rtilde, 1, machine.which.max))] <- unname(apply(Rtilde, 1, machine.max))
+    }
+    }
+    
+    #compute modularity
+    cs <- unique(c(Tind[, 2], Rind[, 2]))
+    Tt = t(sparseMatrix(i = Tind[, 1], j = Tind[, 2], x = 1, 
+                        dims = c(q, length(cs)), index1 = TRUE)) # sparse matrix containing gene x community information
+    Qthen <- Qnow
+    Qcom <- diag(Tt %*% BTR)/m
+    Qnow <- sum(Qcom)
+    Qhist = c(Qhist,Qnow)
+    
+    print(paste("Q =",Qnow,sep=" "))
+    if(Qnow != 0){
+      deltaQ = Qnow - Qthen
+    }
+    iter=iter+1
+  }
+  #__________end_while_____________
+  qcom_temp <- cbind(Qcom,sort(unique(cs)))
+  #drop empty communities
+  qcom_out <- qcom_temp[qcom_temp[,1] > 0,]
+  #if communities were dropped, relabel so community labels can function
+  #as row/column indices in the modularity matrix, B_ij.
+  if(nrow(qcom_out) < nrow(qcom_temp)){
+    qcom_out[,2] <- as.integer(factor(qcom_out[,2]))
+    R[,2] <- as.integer(factor(R[,2]))
+    Tmat[,2] <- as.integer(factor(Tmat[,2]))
+  }
+  colnames(qcom_out) <- c("Qcom","community")
+  #update condor.object
   condor.object$Qcoms = qcom_out
   condor.object$modularity=Qhist
   condor.object$red.memb=data.frame(red.names=red.names[R[,1]],com=R[,2])
