@@ -29,7 +29,8 @@
 #' instead of \code{\link{condorMatrixModularity}}. This is a slower
 #' implementation of the modularity maximization, which does not store the full
 #' expected adjacency matrix in memory. Useful on a machine with medium RAM. 
-#' However, runtimes are longer.
+#' However, runtimes are longer. Warnings: this version is only efficient if you can 
+#' use several CPU at once (call the parallel package).
 #' @param deltaQmin convergence parameter determining the minimum required increase
 #' in the modularity for each iteration. Default is min(10^{-4},1/(number of edges)),
 #' with number of edges determined by \code{nrow(condor.object$edges)}. User can
