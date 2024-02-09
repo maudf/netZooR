@@ -747,6 +747,8 @@ condorModularityMax = function(condor.object,T0=cbind(seq_len(q),rep(1,q)),weigh
 #' in the modularity for each iteration. Default is min(10^-4,1/(number of edges)),
 #' with number of edges determined by \code{nrow(condor.object$edges)}. User can
 #' set this parameter by passing a numeric value to deltaQmin.
+#' @param stepred number of red nodes that must be treated together
+#' @param stepblue number of blue nodes that must be treated together
 #' @return Qcoms data.frame with modularity of each community.
 #' @return modularity modularity value after each iteration.
 #' @return red.memb community membership of the red nodes
@@ -762,10 +764,10 @@ condorModularityMax = function(condor.object,T0=cbind(seq_len(q),rep(1,q)),weigh
 #' T0 <- data.frame(nodes=blues,coms=seq_len(4))
 #' condor.object <- condorSplitMatrixModularity(condor.object,T0=T0)
 #' @import nnet
-#' @import parallel
 #' @export
 condorSplitMatrixModularity = function(condor.object,T0=cbind(seq_len(q),rep(1,q)),
-                                        weights=1,deltaQmin="default"){
+                                        weights=1,deltaQmin="default", stepred=10000, 
+                                       stepblue=200) ){
 
   #assign convergence parameter
   if(deltaQmin == "default"){
@@ -795,18 +797,6 @@ condorSplitMatrixModularity = function(condor.object,T0=cbind(seq_len(q),rep(1,q
     X[abs(X) <= thresh] <- 0
     true_max <- which.is.max(X)
     return(true_max)
-  }
-  SNPcommunity <- function(i, ki, dj, m, edges, weights, Tm){
-    #Compute expected adjacency matrix for SNP i
-    Btilde <- (ki[i]*dj)/m
-    ind <- (names(dj) %in% edges[edges[,1]==names(ki)[i],2])
-    Btilde[ind] <- weights[edges[,1]==names(ki)[i]] + Btilde[ind]
-    Ttilde <- as.matrix(Btilde, ncol=length(Btilde)) %*% Tm
-
-    #Find max for all rows, update R
-    Rind <- machine.which.max(as.numeric(Ttilde))
-
-    return(Rind)
   }
 
   #Convert the edgelist to a sparseMatrix object
@@ -867,9 +857,30 @@ condorSplitMatrixModularity = function(condor.object,T0=cbind(seq_len(q),rep(1,q
   while(deltaQ > deltaQmin){
 
   ### Step 1, assign red nodes
-  Rind[,2] <- mclapply(1:length(ki), SNPcommunity, ki=ki, dj=dj, m=m,
-                      edges=edges, weights=weights, Tm)
-
+  BTR <- NULL # Initialize table with all modularity score for each gene j in each community
+  Tm = matrix(0, nrow = q, ncol = max(Tind[, 2])) #Initialize gene community matrix with genes in lines and communities in columns
+  Tm[Tind] <- 1 #if gene is in community, set cell to 1
+  for(i in seq(stepred, max(stepred, (length(red.names)+stepred)), stepred)){
+    x=(i-(stepred)+1)
+    y=ifelse(i>length(red.names), length(red.names), i)
+    cat("Computing modularity for red nodes", x, "to", y, "...\n")
+    Btilde=-(ki[x:y] %o% dj)/m
+    ind=(edges[,1] %in% x:y)
+    edges.tmp=edges[ind,]
+    edges.tmp[,1]=edges.tmp[,1]-(i-stepred)
+    Btilde[edges.tmp] = weights[ind] + Btilde[edges.tmp]
+    Ttilde = Btilde %*% Tm # Compute modularity for each SNP in each community
+    Rind[x:y, 2] <- unname(apply(Ttilde, 1, machine.which.max)) # Find community for which the modularity is maximum for each SNP
+      
+    #Check to see if new communities should be made
+    negative_contribution <- unname(apply(Ttilde, 1, machine.max)) < 0 # identify SNPs for which only negative modularity are computed in all communities
+    if (any(negative_contribution)) { # if any, put them each in their own new community
+      num_new_com <- sum(negative_contribution)
+      cs <- length(unique(c(Tind[, 2], Rind[Rind[, 2]!=0, 2])))
+      Rind[(x:y)[negative_contribution], 2] <- (cs + 1):(cs + num_new_com)
+    }
+  }
+  
   #Special condition if all nodes are stuck in one large community,
   #if TRUE, randomly assign two nodes to new communities.
 
@@ -878,52 +889,54 @@ condorSplitMatrixModularity = function(condor.object,T0=cbind(seq_len(q),rep(1,q
     Rind[random_nodes,2] <- max(c(Rind[,2],Tind[,2])) + seq_len(2)
   }
 
-  negative_contribution <- unname(apply(Ttilde, 1, machine.max)) <
-    0
+  
 
-    #Check to see if new communities should be made
-    negative_contribution <- unname(apply(Ttilde, 1,machine.max)) < 0
-    if( any( negative_contribution )){
-      #add new communities
-      num_new_com <- sum(negative_contribution)
-      cs <- length(unique(c(Tind[,2],Rind[,2])))
-      Rind[negative_contribution,2] <- (cs + 1):(cs + num_new_com)
+    Rm = matrix(0, nrow = p, ncol = max(Rind[, 2])) #Initialize SNPs community matrix with SNPs in lines and communities in columns
+    Rm[data.matrix(Rind)] <- 1 #if SNP is in community, set cell to 1
+    for(j in seq(stepblue, max(stepblue, (length(blue.names)+stepblue)), stepblue)){
+      x=(j-(stepblue)+1)
+      y=ifelse(j>length(blue.names), length(blue.names), j)
+      cat("Computing modularity for blue nodes", x, "to", y, "...\n")
+      Btilde = -(ki %o% dj[x:y])/m
+      ind=(edges[,2] %in% x:y)
+      edges.tmp=edges[ind,]
+      edges.tmp[,2]=edges.tmp[,2]-(j-stepblue)
+      Btilde[edges.tmp] = weights[ind] + Btilde[edges.tmp]
+      Rtilde = crossprod(Btilde, Rm) # Compute modularity for each gene in each community
+      Tind[x:y, 2] <- unname(apply(Rtilde, 1, machine.which.max)) # Find community for which the modularity is maximum for each gene
+      negative_contribution <- unname(apply(Rtilde, 1, machine.max)) < 0 # identify genes for which only negative modularity are computed in all communities
+      if (any(negative_contribution)) { # if any, put them each in their own new community
+        num_new_com <- sum(negative_contribution)
+        cs <- length(unique(c(Tind[, 2], Rind[, 2])))
+        Tind[(x:y)[negative_contribution], 2] <- (cs + 1):(cs + num_new_com)
+        if(!is.null(dim(BTR))){
+          s=sparseMatrix(i=1:nrow(BTR), j=rep(1, nrow(BTR)), x=0, dims=c(nrow(BTR), num_new_com), index1 = TRUE)
+          BTR <- cbind(BTR, s)
+        }
+      }
+
+      cs <- length(unique(c(Tind[, 2], Rind[, 2])))
+      BTRt = t(sparseMatrix(i = unname(apply(Rtilde, 1, machine.which.max)), j = 1:((y-x+1)), x = unname(apply(Rtilde, 1, machine.max)), 
+                          dims = c(cs, (y-x+1)), index1 = TRUE)) # sparse matrix containing gene x community information
+      BTR <- rbind(BTR, BTRt)
     }
 
-    Rm = matrix(0,nrow=p,ncol=max(Rind[,2]))
-    Rm[data.matrix(Rind)] <- 1
-
-    ### Step 2, assign blue nodes
-    Rtilde = crossprod(Btilde,Rm)
-
-    #Find first max for all rows, update T
-    Tind[,2] <- unname(apply(Rtilde, 1, machine.which.max))
-
-    #Check to see if new communities should be made
-    negative_contribution <- unname(apply(Rtilde, 1,machine.max)) < 0
-    if( any( negative_contribution )){
-      #add new communities
-      num_new_com <- sum(negative_contribution)
-      cs <- length(unique(c(Tind[,2],Rind[,2])))
-      Tind[negative_contribution,2] <- (cs + 1):(cs + num_new_com)
-    }
-
-    #Tm dimensions, note the extra empty community.
-    Tm = matrix(0,nrow=q,ncol=max(Tind[,2]))
-    Tm[data.matrix(Tind)] <- 1
-
+    # Reset gene community matrix with new values
+    cs <- unique(c(Tind[, 2], Rind[, 2]))
+    Tt = t(sparseMatrix(i = Tind[, 1], j = Tind[, 2], x = 1, 
+                        dims = c(q, length(cs)), index1 = TRUE)) # sparse matrix containing gene x community information
+    
+   
     Qthen <- Qnow
     #replace with diag(crossprod(T,BTR))/m
-    Qcom <- diag(crossprod(Rm,Btilde %*% Tm))/m
-    Qnow <- sum(Qcom)
-    if(abs(Qnow) < .Machine$double.eps){Qnow <- 0}
-    Qhist = c(Qhist,Qnow)
-
-    print(paste("Q =",Qnow,sep=" "))
-    if(Qnow != 0){
-      deltaQ = Qnow - Qthen
+    Qcom <- diag(Tt %*% BTR)/m # Compute modularity for each community
+    Qnow <- sum(Qcom) # compute total modularity
+    Qhist = c(Qhist, Qnow) # store total modularity
+    print(paste("Q =", Qnow, sep = " "))
+    if (Qnow != 0) {
+      deltaQ = Qnow - Qthen # compute modularity difference
     }
-    iter=iter+1
+    iter = iter + 1 # increment loop count
   }
 
   #__________end_while_____________
